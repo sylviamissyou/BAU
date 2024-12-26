@@ -1,0 +1,262 @@
+import h2o
+from h2o.estimators import H2ORandomForestEstimator, H2OXGBoostEstimator, H2OGradientBoostingEstimator,H2OGeneralizedLinearEstimator
+import pandas as pd
+import numpy as np
+
+class Meta_Learning():
+    XGBoost_Learner_Meta = {'ntrees':100,
+                        'min_rows':10,
+                        'stopping_tolerance':1e-8,
+                        'ignore_const_cols':False,
+                         'categorical_encoding':'OneHotExplicit'}
+
+    LR_PS_SCR_Learner_Meta =  {'family':'binomial',
+                               'lambda_':0,
+                               'ignore_const_cols':False,
+                               'remove_collinear_columns':False,
+                               'max_iterations':1000,
+                               'standardize':False,
+                               'stopping_tolerance':1e-6}
+
+    def __init__(self,
+                 Data,
+                 Treatment_Attribute,
+                 Control_Level,
+                 Test_Level,
+                 Train_Columns, 
+                 Response_Target,
+                 Segment = [],
+                 outcome_model = 'XGBoost',
+                 cate_model = 'XGBoost',
+                 propensity_model = 'LR',
+                 H2o_container_min_mem_size = '32g',
+                 H2o_container_max_mem_size = '128g'):
+
+        h2o.init(
+            min_mem_size = H2o_container_min_mem_size,
+            max_mem_size = H2o_container_max_mem_size
+        )
+        
+        self.Data = Data
+        self.Data_Col = {}
+        self.H2O_Data_Column_Type = {}
+        
+        data_type_pd = Data.dtypes.reset_index().rename(columns = {'index':'colname',0:'type'})
+        for index,j in data_type_pd.iterrows():
+            self.Data_Col[j.colname] = j.type
+            if j.type == 'string' and j.colname not in Train_Columns:
+                self.H2O_Data_Column_Type[j.colname] = 'string'
+            
+
+        self.Treatment_Attribute = Treatment_Attribute
+        self.Control_Level = Control_Level
+        self.Test_Level = Test_Level
+        self.Train_Columns = Train_Columns
+        self.Response_Target = Response_Target
+        self.Segment = Segment
+        self.outcome_models = outcome_model
+        if self.outcome_models not in ['XGBoost']:
+            raise Exception(f"{self.outcome_models} is not available, please select the model from ['XGBoost']")
+        self.cate_models = cate_model
+        if self.cate_models not in ['XGBoost']:
+            raise Exception(f"{self.cate_models} is not available, please select the model from ['XGBoost']")
+        self.propensity_model = propensity_model
+        if self.propensity_model  not in ['LR']:
+            raise Exception(f"{self.propensity_model} is not available, please select the model from ['GLM LG']")
+        
+        for i in self.Train_Columns:
+            if i in self.Segment:
+                raise Exception(f"attribute {i} is treated as segment and should not be included in Train_Columns")
+
+
+    def __Pandas_Data_Type_Adjustment_Adjustment(self):
+       for index, i in self.Data_Col.items():
+            self.Data[index] = self.Data[index].apply(lambda x: None if x == '' else x)
+            if i != 'datetime64[ns]':
+                self.Data[index] = self.Data[index].astype(i)
+            elif i == 'datetime64[ns]':
+                self.Data[index] = pd.to_datetime(self.Data[index].astype(float), unit='ms')
+        
+    def __XGBoost_Learning(self, Data, Response_Variable,model_id):
+
+        def Sub_func(i, Data, Response_Variable):
+            query_txt = ' and '.join([attr + " == '" + seg_list.loc[i,attr] +"'" for attr in self.Segment])
+            sub_output = model_excu_report.query(query_txt)
+            contrl_mdl_status = sub_output[sub_output[self.Treatment_Attribute] == self.Control_Level].reset_index(drop = True)
+            test_mdl_status = sub_output[sub_output[self.Treatment_Attribute] == self.Test_Level].reset_index(drop = True)
+
+            H2o_df = eval("Data["+ '&'.join(["(Data['" + attr + "'] == '" + seg_list.loc[i,attr] +"')" for attr in self.Segment]) + "]")
+            ctrl_data = H2o_df[H2o_df[self.Treatment_Attribute] == self.Control_Level]
+            if contrl_mdl_status.shape[0] > 0 and contrl_mdl_status.loc[0,'status'] == 'SUCCEEDED' and ctrl_data.shape[0] > 2 * self.XGBoost_Learner_Meta['min_rows']:
+                contrl_mdl_id = contrl_mdl_status.loc[0, 'model']
+                ctrl_mdl = h2o.get_model(contrl_mdl_id)
+                H2o_df['XGBoost_Contrl'] = ctrl_mdl.predict(H2o_df[self.Train_Columns])
+            elif contrl_mdl_status.shape[0] > 0 and contrl_mdl_status.loc[0,'status'] == 'FAILED' and ctrl_data.shape[0] > 0:
+                H2o_df['XGBoost_Contrl'] = ctrl_data[Response_Variable].mean()[0]
+            else:
+                H2o_df['XGBoost_Contrl'] = 0
+
+            test_data = H2o_df[H2o_df[self.Treatment_Attribute] == self.Test_Level]
+            if test_mdl_status.shape[0] > 0 and test_mdl_status.loc[0,'status'] == 'SUCCEEDED' and test_data.shape[0] > 2 * self.XGBoost_Learner_Meta['min_rows']:
+                test_mdl_id = test_mdl_status.loc[0, 'model']
+                test_mdl = h2o.get_model(test_mdl_id)
+                H2o_df['XGBoost_Test'] = test_mdl.predict(H2o_df[self.Train_Columns])
+            elif test_data.shape[0] > 0:
+                H2o_df['XGBoost_Test'] = test_data[Response_Variable].mean()[0]
+            else:
+                H2o_df['XGBoost_Test'] = 0
+            return H2o_df
+ 
+        mdl = H2OXGBoostEstimator(
+            ntrees = self.XGBoost_Learner_Meta['ntrees'],
+            min_rows = self.XGBoost_Learner_Meta['min_rows'] ,
+            stopping_tolerance = self.XGBoost_Learner_Meta['stopping_tolerance'], 
+            ignore_const_cols =  self.XGBoost_Learner_Meta['ignore_const_cols'],
+            categorical_encoding = self.XGBoost_Learner_Meta['categorical_encoding'],
+            seed = 1234
+        )
+        for i in [self.Treatment_Attribute] + self.Segment:
+            Data[i] = Data[i].ascharacter().asfactor()
+
+        models = mdl.train_segments(x=self.Train_Columns, y= Response_Variable, training_frame = Data,
+                                      segments = [self.Treatment_Attribute] + self.Segment,
+                                      segment_models_id = model_id,
+                                      parallelism = 32,
+                                      max_runtime_secs = 300)
+        model_excu_report = models.as_frame().as_data_frame(use_multi_thread=True)
+
+        for i in model_excu_report.columns:
+            model_excu_report[i] = model_excu_report[i].astype(str)
+        seg_list = model_excu_report[self.Segment].drop_duplicates().reset_index(drop = True)
+        List_Result = [Sub_func(i,Data,Response_Variable) for i,j in seg_list.iterrows()]
+        Final_df = List_Result[0].concat(List_Result[1:],axis = 0)
+        return Final_df
+                
+    def __LR_PS_Learning(self,Data,model_id):
+
+        def Sub_func(i,seg_list, Data):
+            query_txt = ' and '.join([attr + " == '" + seg_list.loc[i,attr] +"'" for attr in self.Segment])
+            sub_output = model_excu_report.query(query_txt).reset_index(drop = True)
+            H2o_df = eval("Data["+ '&'.join(["(Data['" + attr + "'] == '" + seg_list.loc[i,attr] +"')" for attr in self.Segment]) + "]")
+
+            try:
+                if sub_output.loc[0,'status'] == 'SUCCEEDED':
+                    mdl_id = sub_output.loc[0, 'model']
+                    lg_mdl = h2o.get_model(mdl_id)
+                    H2o_df['PS_SCR'] =  lg_mdl.predict(H2o_df[self.Train_Columns])['p1']
+                elif len(H2o_df['TEST_IND'].unique()) == 1:
+                    if H2o_df['TEST_IND'].unique()[0,0] == 1:
+                        H2o_df['PS_SCR'] = 1
+                    else:
+                        H2o_df['PS_SCR'] = 0
+                else:
+                    H2o_df['PS_SCR'] = 0
+                return H2o_df
+            except:
+                H2o_df['PS_SCR'] = 0.5
+                return H2o_df
+
+        
+        ps_mod = H2OGeneralizedLinearEstimator(family = self.LR_PS_SCR_Learner_Meta['family'],
+                                               lambda_ = self.LR_PS_SCR_Learner_Meta['lambda_'], 
+                                               ignore_const_cols = self.LR_PS_SCR_Learner_Meta['ignore_const_cols'],
+                                               remove_collinear_columns = self.LR_PS_SCR_Learner_Meta['remove_collinear_columns'],
+                                               max_iterations = self.LR_PS_SCR_Learner_Meta['max_iterations'],
+                                               standardize = self.LR_PS_SCR_Learner_Meta['standardize'],
+                                               stopping_tolerance = self.LR_PS_SCR_Learner_Meta['stopping_tolerance']
+                                              )
+        for i in self.Segment:
+            Data[i] = Data[i].ascharacter().asfactor()
+
+        models = ps_mod.train_segments(x = self.Train_Columns, 
+                                       y = 'TEST_IND', 
+                                       training_frame = Data,
+                                       segments = self.Segment,
+                                       segment_models_id = model_id,
+                                       max_runtime_secs = 300,
+                                       parallelism = 32)
+        model_excu_report = models.as_frame().as_data_frame(use_multi_thread=True)
+        
+        for i in model_excu_report.columns:
+            model_excu_report[i] = model_excu_report[i].astype(str)
+        seg_list = model_excu_report[self.Segment].drop_duplicates().reset_index(drop = True)
+
+        List_Result = [Sub_func(i,seg_list, Data) for i,j in seg_list.iterrows()]
+        Final_df = List_Result[0].concat(List_Result[1:],axis = 0)
+        return Final_df
+
+    def Outcome_Estimator(self):
+        full_data = h2o.H2OFrame(self.Data,column_types = self.H2O_Data_Column_Type)
+        if self.outcome_models == 'XGBoost':
+            full_data = self.__XGBoost_Learning(full_data,self.Response_Target,'outcome_model')
+            full_data.set_name('XGBoost_Contrl', self.Control_Level + '_outcome')
+            full_data.set_name('XGBoost_Test', self.Test_Level + '_outcome')
+        else:
+            raise Exception(f"{self.outcome_models} is not available, please select the model from ['XGBoost']")
+
+        ctrl_data = full_data[full_data[self.Treatment_Attribute] == self.Control_Level]
+        test_data = full_data[full_data[self.Treatment_Attribute] == self.Test_Level]
+        ctrl_data['CATE'] = ctrl_data[self.Test_Level + '_outcome'] - ctrl_data[self.Response_Target]
+        test_data['CATE'] = test_data[self.Response_Target] - test_data[self.Control_Level + '_outcome']
+
+        full_data = ctrl_data.concat([test_data],axis = 0)
+        pandas_df = full_data.as_data_frame(use_multi_thread=True,use_pandas=False)
+        pandas_df = pd.DataFrame(pandas_df[1:],columns = pandas_df[0])
+        self.Data = pandas_df
+        
+        self.Data_Col['CATE'] = 'float64'
+        self.Data_Col[self.Control_Level + '_outcome'] = 'float64'
+        self.Data_Col[self.Test_Level + '_outcome'] = 'float64'
+
+        
+        self.__Pandas_Data_Type_Adjustment_Adjustment()
+        a = [h2o.remove(i) for i in h2o.ls().key]
+        
+
+
+    def Cate_Estimator(self):
+        full_data = h2o.H2OFrame(self.Data,column_types = self.H2O_Data_Column_Type)
+        if self.cate_models == 'XGBoost':
+            full_data = self.__XGBoost_Learning(full_data,'CATE','cate_model')
+            full_data.set_name('XGBoost_Contrl', self.Control_Level + '_cate')
+            full_data.set_name('XGBoost_Test', self.Test_Level + '_cate')
+        else:
+            raise Exception(f"{self.cate_models} is not available, please select the model from ['XGBoost']")
+        pandas_df = full_data.as_data_frame(use_multi_thread=True,use_pandas=False)
+        pandas_df = pd.DataFrame(pandas_df[1:],columns = pandas_df[0])
+        self.Data = pandas_df
+        
+        self.Data_Col[self.Control_Level + '_cate'] = 'float64'
+        self.Data_Col[self.Test_Level + '_cate'] = 'float64'
+        
+        self.__Pandas_Data_Type_Adjustment_Adjustment()
+        a = [h2o.remove(i) for i in h2o.ls().key]
+
+    
+    def Propensity_Score_Estimator(self):
+
+        full_data = h2o.H2OFrame(self.Data,column_types = self.H2O_Data_Column_Type)
+        for i in self.Segment:
+            if full_data.types[i] != 'string':
+               full_data[i] = full_data[i].ascharacter().asfactor()
+        full_data['TEST_IND'] =  h2o.H2OFrame.ifelse(full_data[self.Treatment_Attribute] == self.Test_Level,1, 0)      
+        if self.propensity_model == 'LR':
+            full_data = self.__LR_PS_Learning(full_data,'ps_model')
+        else:
+            raise Exception(f"{self.propensity_model} is not available, please select the model from ['GLM LG']")
+
+        pandas_df = full_data.as_data_frame(use_multi_thread=True,use_pandas=False)
+        pandas_df = pd.DataFrame(pandas_df[1:],columns = pandas_df[0])
+        
+        self.Data = pandas_df
+
+        self.Data_Col['TEST_IND'] = 'int64'
+        self.Data_Col['PS_SCR'] = 'float64'
+        self.Data.loc[self.Data.PS_SCR == '','PS_SCR'] = np.nan
+        self.__Pandas_Data_Type_Adjustment_Adjustment()
+        a = [h2o.remove(i) for i in h2o.ls().key]
+
+    def Meta_X_Learner(self):
+        full_data = self.Data
+        full_data['UPLIFT'] = full_data[self.Test_Level + '_cate'] *  full_data['PS_SCR'] +  full_data[self.Control_Level + '_cate'] *  (1 - full_data['PS_SCR'])
+        return full_data
